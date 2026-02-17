@@ -1,19 +1,18 @@
 """
 Haystack 2.x を用いた RAG システム
 
-- InMemoryDocumentStore + OpenAI Embedding ベクトル検索
+- ChromaDB 永続化 + OpenAI Embedding ベクトル検索
 - Pipeline クラスによるインジェスション / クエリフローの明示的記述
 - 各ステップのデータ入出力ログによるパイプライン可視化
 
 LlamaIndex 版 (rag_mark-1/main.py) と同等の機能を Haystack 2.x で再実装。
-違い:
-  - ChromaDB 永続化 → InMemoryDocumentStore（起動ごとに再構築）
 """
 
 import argparse
 import logging
 import os
 import re
+import shutil
 import sys
 from pathlib import Path
 from typing import Dict, List, Optional
@@ -26,9 +25,9 @@ from haystack.components.builders import PromptBuilder
 from haystack.components.embedders import OpenAIDocumentEmbedder, OpenAITextEmbedder
 from haystack.components.generators import OpenAIGenerator
 from haystack.components.preprocessors import DocumentCleaner
-from haystack.components.retrievers.in_memory import InMemoryEmbeddingRetriever
 from haystack.components.writers import DocumentWriter
-from haystack.document_stores.in_memory import InMemoryDocumentStore
+from haystack_integrations.components.retrievers.chroma import ChromaEmbeddingRetriever
+from haystack_integrations.document_stores.chroma import ChromaDocumentStore
 
 
 # ─── 環境変数 ──────────────────────────────────────────────────────
@@ -57,6 +56,10 @@ if not DATA_DIR.exists():
     _fallback_data = Path(__file__).resolve().parent.parent / "rag_mark-1" / "data"
     if _fallback_data.exists():
         DATA_DIR = _fallback_data
+
+# ChromaDB 永続化設定
+STORAGE_DIR = Path("./storage")
+COLLECTION_NAME = "rag_collection"
 
 # チャンク分割設定（文字数ベース、LlamaIndex 版の 1000 トークンに相当）
 CHUNK_SIZE = 1000
@@ -274,7 +277,7 @@ def load_all_documents() -> List[Document]:
 #  インジェスションパイプライン
 # ═══════════════════════════════════════════════════════════════════
 
-def build_indexing_pipeline(document_store: InMemoryDocumentStore) -> Pipeline:
+def build_indexing_pipeline(document_store: ChromaDocumentStore) -> Pipeline:
     """
     ドキュメント取り込みパイプラインを構築する。
 
@@ -348,7 +351,7 @@ def build_indexing_pipeline(document_store: InMemoryDocumentStore) -> Pipeline:
 #  クエリパイプライン
 # ═══════════════════════════════════════════════════════════════════
 
-def build_query_pipeline(document_store: InMemoryDocumentStore) -> Pipeline:
+def build_query_pipeline(document_store: ChromaDocumentStore) -> Pipeline:
     """
     質問応答パイプラインを構築する。
 
@@ -376,7 +379,7 @@ def build_query_pipeline(document_store: InMemoryDocumentStore) -> Pipeline:
     )
     pipe.add_component(
         "retriever",
-        InMemoryEmbeddingRetriever(
+        ChromaEmbeddingRetriever(
             document_store=document_store,
             top_k=TOP_K,
         ),
@@ -483,7 +486,7 @@ def main():
     parser.add_argument(
         "--rebuild",
         action="store_true",
-        help="インデックスを再構築（InMemory のため毎回再構築されます）",
+        help="インデックスを再構築する（既存のストレージを削除）",
     )
     args = parser.parse_args()
 
@@ -493,29 +496,42 @@ def main():
         print("   .env ファイルを作成し、APIキーを設定してください。")
         return
 
+    # ── --rebuild オプション ──────────────────────────────────
+    if args.rebuild and STORAGE_DIR.exists():
+        print("🗑️  既存のインデックスを削除しています…")
+        shutil.rmtree(STORAGE_DIR)
+        print("✅ 削除完了。再構築します。")
+
     try:
-        # ── 1. DocumentStore 初期化 ──────────────────────────
-        print("📦 InMemoryDocumentStore を初期化中…")
-        document_store = InMemoryDocumentStore()
-
-        # ── 2. ドキュメント読み込み ──────────────────────────
-        print(f"📄 ドキュメントを読み込み中… (ソース: {DATA_DIR})")
-        documents = load_all_documents()
-
-        # ── 3. インジェスションパイプライン ────────────────────
-        print("\n🔧 インジェスションパイプラインを構築中…")
-        indexing_pipeline = build_indexing_pipeline(document_store)
-
-        print("\n📊 インジェスションパイプライン構造:")
-        print(indexing_pipeline)
-
-        print("\n🚀 インジェスションパイプラインを実行中…")
-        indexing_result = indexing_pipeline.run(
-            {"log_input": {"documents": documents}}
+        # ── 1. ChromaDocumentStore 初期化 ────────────────────
+        print(f"📦 ChromaDocumentStore を初期化中… (永続化先: {STORAGE_DIR})")
+        document_store = ChromaDocumentStore(
+            collection_name=COLLECTION_NAME,
+            persist_path=str(STORAGE_DIR),
         )
-        written = indexing_result.get("writer", {}).get("documents_written", 0)
-        print(f"\n✅ DocumentStore に {written} 件のチャンクを格納しました。")
-        print(f"   (DocumentStore 内の総ドキュメント数: {document_store.count_documents()})")
+
+        # ── 2. 既存インデックスの確認 ────────────────────────
+        existing_count = document_store.count_documents()
+        if existing_count > 0:
+            print(f"📂 既存のインデックスを読み込みました。({existing_count} 件のチャンク)")
+        else:
+            # ── 3. ドキュメント読み込み・インジェスション ──────
+            print(f"📄 ドキュメントを読み込み中… (ソース: {DATA_DIR})")
+            documents = load_all_documents()
+
+            print("\n🔧 インジェスションパイプラインを構築中…")
+            indexing_pipeline = build_indexing_pipeline(document_store)
+
+            print("\n📊 インジェスションパイプライン構造:")
+            print(indexing_pipeline)
+
+            print("\n🚀 インジェスションパイプラインを実行中…")
+            indexing_result = indexing_pipeline.run(
+                {"log_input": {"documents": documents}}
+            )
+            written = indexing_result.get("writer", {}).get("documents_written", 0)
+            print(f"\n✅ DocumentStore に {written} 件のチャンクを格納しました。")
+            print(f"   (DocumentStore 内の総ドキュメント数: {document_store.count_documents()})")
 
         # ── 4. クエリパイプライン ─────────────────────────────
         print("\n🔧 クエリパイプラインを構築中…")

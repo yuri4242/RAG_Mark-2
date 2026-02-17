@@ -18,6 +18,8 @@ from openai import OpenAI
 # メインの RAG システムからインポート
 from main import (
     DATA_DIR,
+    STORAGE_DIR,
+    COLLECTION_NAME,
     SYSTEM_PROMPT,
     TOP_K,
     CHUNK_SIZE,
@@ -27,7 +29,7 @@ from main import (
     load_all_documents,
     pipeline_logger,
 )
-from haystack.document_stores.in_memory import InMemoryDocumentStore
+from haystack_integrations.document_stores.chroma import ChromaDocumentStore
 
 # ─── 環境変数 ──────────────────────────────────────────────────────
 load_dotenv()
@@ -70,23 +72,30 @@ def load_test_cases() -> list[dict]:
 def initialize_rag_system():
     """
     Haystack パイプラインを構築し、ドキュメントを読み込んでインデックス化する。
-    Returns: (query_pipeline, document_store)
+    Returns: query_pipeline
     """
     import logging
     # 評価時はパイプラインログを抑制
     pipeline_logger.setLevel(logging.WARNING)
 
-    print("📦 InMemoryDocumentStore を初期化中…")
-    document_store = InMemoryDocumentStore()
+    print(f"📦 ChromaDocumentStore を初期化中… (永続化先: {STORAGE_DIR})")
+    document_store = ChromaDocumentStore(
+        collection_name=COLLECTION_NAME,
+        persist_path=str(STORAGE_DIR),
+    )
 
-    print(f"📄 ドキュメントを読み込み中… (ソース: {DATA_DIR})")
-    documents = load_all_documents()
+    existing_count = document_store.count_documents()
+    if existing_count > 0:
+        print(f"📂 既存のインデックスを読み込みました。({existing_count} 件のチャンク)")
+    else:
+        print(f"📄 ドキュメントを読み込み中… (ソース: {DATA_DIR})")
+        documents = load_all_documents()
 
-    print("🔧 インジェスションパイプラインを実行中…")
-    indexing_pipeline = build_indexing_pipeline(document_store)
-    indexing_result = indexing_pipeline.run({"log_input": {"documents": documents}})
-    written = indexing_result.get("writer", {}).get("documents_written", 0)
-    print(f"✅ {written} 件のチャンクを格納しました。")
+        print("🔧 インジェスションパイプラインを実行中…")
+        indexing_pipeline = build_indexing_pipeline(document_store)
+        indexing_result = indexing_pipeline.run({"log_input": {"documents": documents}})
+        written = indexing_result.get("writer", {}).get("documents_written", 0)
+        print(f"✅ {written} 件のチャンクを格納しました。")
 
     print("🔧 クエリパイプラインを構築中…")
     query_pipeline = build_query_pipeline(document_store)

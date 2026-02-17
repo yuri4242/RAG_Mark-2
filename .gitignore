@@ -1,4 +1,7 @@
 data/
+storage/
+evaluation_results.json
+.gitignore
 .env
 __pycache__/
 *.pyc
