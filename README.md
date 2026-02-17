@@ -1,9 +1,9 @@
 # RAG Mark-2
 
-Haystack 2.x + ChromaDB を用いた日本語対応 RAG（Retrieval-Augmented Generation）チャットシステムです。
+Haystack 2.24 + ChromaDB を用いた日本語対応 RAG（Retrieval-Augmented Generation）チャットシステムです。
 PDF ドキュメントをベクトル化し、質問に対して資料に基づいた回答を生成します。
 
-[rag_mark-1](../rag_mark-1/) の LlamaIndex 版を Haystack 2.x で再実装したものです。
+[rag_mark-1](../rag_mark-1/) の LlamaIndex 版を Haystack 2.24 で再実装したものです。
 
 ## 構成
 
@@ -14,11 +14,11 @@ PDF ドキュメントをベクトル化し、質問に対して資料に基づ�
 | Vector Store | ChromaDB（永続化） |
 | PDF 読み込み | PyMuPDF |
 | チャンク分割 | 日本語対応カスタムスプリッター（句点・改行区切り） |
-| フレームワーク | Haystack 2.x |
+| フレームワーク | Haystack 2.24 |
 
 ## mark-1 との主な違い
 
-- **フレームワーク**: LlamaIndex → Haystack 2.x
+- **フレームワーク**: LlamaIndex → Haystack 2.24
 - **チャンク分割**: 日本語テキスト向けのカスタムスプリッター（文字数ベース、句点・改行で区切り）
 - **パイプライン可視化**: 各ステップにログコンポーネントを挟み、データの流れを可視化
 - **Reranker**: なし（ベクトル検索のみ）
