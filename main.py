@@ -1,13 +1,12 @@
 """
 Haystack 2.x を用いた RAG システム
 
-- InMemoryDocumentStore + BM25 リトリーバー
+- InMemoryDocumentStore + OpenAI Embedding ベクトル検索
 - Pipeline クラスによるインジェスション / クエリフローの明示的記述
 - 各ステップのデータ入出力ログによるパイプライン可視化
 
 LlamaIndex 版 (rag_mark-1/main.py) と同等の機能を Haystack 2.x で再実装。
 違い:
-  - ベクトル検索 → BM25 キーワード検索（エンベディング不要）
   - ChromaDB 永続化 → InMemoryDocumentStore（起動ごとに再構築）
 """
 
@@ -24,9 +23,10 @@ from dotenv import load_dotenv
 
 from haystack import Document, Pipeline, component
 from haystack.components.builders import PromptBuilder
+from haystack.components.embedders import OpenAIDocumentEmbedder, OpenAITextEmbedder
 from haystack.components.generators import OpenAIGenerator
 from haystack.components.preprocessors import DocumentCleaner
-from haystack.components.retrievers.in_memory import InMemoryBM25Retriever
+from haystack.components.retrievers.in_memory import InMemoryEmbeddingRetriever
 from haystack.components.writers import DocumentWriter
 from haystack.document_stores.in_memory import InMemoryDocumentStore
 
@@ -62,17 +62,9 @@ if not DATA_DIR.exists():
 CHUNK_SIZE = 1000
 CHUNK_OVERLAP = 300
 
-# BM25 検索設定
-BM25_TOP_K = 10
-
-# 日本語対応 BM25 トークナイズ正規表現
-#   ひらがな連続 | カタカナ連続 | 漢字（個別） | ASCII 英数字
-JAPANESE_BM25_REGEX = (
-    r"[a-zA-Z0-9]+"        # 英数字の連続
-    r"|[\u3040-\u309F]+"    # ひらがなの連続（助詞・活用語尾）
-    r"|[\u30A0-\u30FF]+"    # カタカナの連続（外来語など）
-    r"|[\u4E00-\u9FFF]"     # 漢字（1文字ずつ）
-)
+# ベクトル検索設定
+EMBEDDING_MODEL = "text-embedding-3-large"
+TOP_K = 10
 
 # ─── プロンプト ────────────────────────────────────────────────────
 SYSTEM_PROMPT = (
@@ -288,12 +280,14 @@ def build_indexing_pipeline(document_store: InMemoryDocumentStore) -> Pipeline:
 
     フロー:
       入力ドキュメント (PyMuPDF で読み込んだ生ページ)
-        → log_input    : ログ出力（生ドキュメントの状態を確認）
-        → cleaner      : 空行・余分な空白を除去
-        → log_cleaned  : ログ出力（クリーニング後の状態を確認）
-        → splitter     : 日本語対応チャンク分割 (1000文字, 300文字オーバーラップ)
-        → log_split    : ログ出力（分割後のチャンク数・内容を確認）
-        → writer       : InMemoryDocumentStore へ書き込み
+        → log_input      : ログ出力（生ドキュメントの状態を確認）
+        → cleaner        : 空行・余分な空白を除去
+        → log_cleaned    : ログ出力（クリーニング後の状態を確認）
+        → splitter       : 日本語対応チャンク分割 (1000文字, 300文字オーバーラップ)
+        → log_split      : ログ出力（分割後のチャンク数・内容を確認）
+        → doc_embedder   : OpenAI Embedding でベクトル化
+        → log_embedded   : ログ出力（エンベディング後の状態を確認）
+        → writer         : InMemoryDocumentStore へ書き込み
     """
     pipe = Pipeline()
 
@@ -325,6 +319,14 @@ def build_indexing_pipeline(document_store: InMemoryDocumentStore) -> Pipeline:
         DocumentLogger("3. チャンク分割後"),
     )
     pipe.add_component(
+        "doc_embedder",
+        OpenAIDocumentEmbedder(model=EMBEDDING_MODEL),
+    )
+    pipe.add_component(
+        "log_embedded",
+        DocumentLogger("4. エンベディング後"),
+    )
+    pipe.add_component(
         "writer",
         DocumentWriter(document_store=document_store),
     )
@@ -335,7 +337,9 @@ def build_indexing_pipeline(document_store: InMemoryDocumentStore) -> Pipeline:
     pipe.connect("cleaner.documents", "log_cleaned.documents")
     pipe.connect("log_cleaned.documents", "splitter.documents")
     pipe.connect("splitter.documents", "log_split.documents")
-    pipe.connect("log_split.documents", "writer.documents")
+    pipe.connect("log_split.documents", "doc_embedder.documents")
+    pipe.connect("doc_embedder.documents", "log_embedded.documents")
+    pipe.connect("log_embedded.documents", "writer.documents")
 
     return pipe
 
@@ -350,12 +354,13 @@ def build_query_pipeline(document_store: InMemoryDocumentStore) -> Pipeline:
 
     フロー:
       ユーザー質問 (query)
-        → log_query      : ログ出力（受信クエリを確認）
-        ├→ retriever     : BM25 キーワード検索 (top_k=10)
-        │   → log_retrieved : ログ出力（検索結果ドキュメントを確認）
-        │       → prompt_builder : Jinja テンプレートでプロンプト組み立て
-        └→ prompt_builder  ← query も直接渡す
-              → llm          : OpenAI gpt-4o で回答生成 (temperature=0.1)
+        → log_query        : ログ出力（受信クエリを確認）
+        ├→ text_embedder   : OpenAI Embedding でクエリをベクトル化
+        │   → retriever    : ベクトル類似度検索 (top_k=10)
+        │       → log_retrieved : ログ出力（検索結果ドキュメントを確認）
+        │           → prompt_builder : Jinja テンプレートでプロンプト組み立て
+        └→ prompt_builder    ← query も直接渡す
+              → llm            : OpenAI gpt-4o で回答生成 (temperature=0.1)
                   → log_response : ログ出力（生成結果を確認）
     """
     pipe = Pipeline()
@@ -366,15 +371,19 @@ def build_query_pipeline(document_store: InMemoryDocumentStore) -> Pipeline:
         QueryLogger("1. ユーザークエリ受信"),
     )
     pipe.add_component(
+        "text_embedder",
+        OpenAITextEmbedder(model=EMBEDDING_MODEL),
+    )
+    pipe.add_component(
         "retriever",
-        InMemoryBM25Retriever(
+        InMemoryEmbeddingRetriever(
             document_store=document_store,
-            top_k=BM25_TOP_K,
+            top_k=TOP_K,
         ),
     )
     pipe.add_component(
         "log_retrieved",
-        DocumentLogger("2. BM25 検索結果"),
+        DocumentLogger("2. ベクトル検索結果"),
     )
     pipe.add_component(
         "prompt_builder",
@@ -393,11 +402,12 @@ def build_query_pipeline(document_store: InMemoryDocumentStore) -> Pipeline:
     )
 
     # ── コンポーネント接続 ─────────────────────────────────────
-    # query は log_query から retriever と prompt_builder の両方へ分岐
-    pipe.connect("log_query.query", "retriever.query")
+    # query は log_query から text_embedder と prompt_builder の両方へ分岐
+    pipe.connect("log_query.query", "text_embedder.text")
     pipe.connect("log_query.query", "prompt_builder.query")
 
-    # 検索結果 → ログ → プロンプトビルダー → LLM → ログ
+    # エンベディング → 検索 → ログ → プロンプトビルダー → LLM → ログ
+    pipe.connect("text_embedder.embedding", "retriever.query_embedding")
     pipe.connect("retriever.documents", "log_retrieved.documents")
     pipe.connect("log_retrieved.documents", "prompt_builder.documents")
     pipe.connect("prompt_builder.prompt", "llm.prompt")
@@ -413,7 +423,7 @@ def build_query_pipeline(document_store: InMemoryDocumentStore) -> Pipeline:
 def chat_loop(query_pipeline: Pipeline):
     """CLI チャットループ"""
     print("\n" + "=" * 50)
-    print("RAG チャットシステム (Haystack 2.x + BM25)")
+    print("RAG チャットシステム (Haystack 2.x + ベクトル検索)")
     print("質問を入力してください（終了するには 'exit' と入力）")
     print("=" * 50 + "\n")
 
@@ -451,7 +461,7 @@ def chat_loop(query_pipeline: Pipeline):
                     page = doc.meta.get("page_number", "N/A")
                     score = doc.score
                     if isinstance(score, float):
-                        print(f"  [{i}] {fname} (p.{page}, BM25スコア: {score:.4f})")
+                        print(f"  [{i}] {fname} (p.{page}, 類似度スコア: {score:.4f})")
                     else:
                         print(f"  [{i}] {fname} (p.{page})")
                 print("------------------\n")
@@ -469,7 +479,7 @@ def chat_loop(query_pipeline: Pipeline):
 # ═══════════════════════════════════════════════════════════════════
 
 def main():
-    parser = argparse.ArgumentParser(description="RAG チャット (Haystack 2.x + BM25)")
+    parser = argparse.ArgumentParser(description="RAG チャット (Haystack 2.x + ベクトル検索)")
     parser.add_argument(
         "--rebuild",
         action="store_true",
@@ -486,9 +496,7 @@ def main():
     try:
         # ── 1. DocumentStore 初期化 ──────────────────────────
         print("📦 InMemoryDocumentStore を初期化中…")
-        document_store = InMemoryDocumentStore(
-            bm25_tokenization_regex=JAPANESE_BM25_REGEX,
-        )
+        document_store = InMemoryDocumentStore()
 
         # ── 2. ドキュメント読み込み ──────────────────────────
         print(f"📄 ドキュメントを読み込み中… (ソース: {DATA_DIR})")

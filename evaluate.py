@@ -1,5 +1,5 @@
 """
-Haystack 2.x RAG 評価スクリプト
+Haystack 2.x RAG 評価スクリプト（ベクトル検索版）
 
 LLM を使って Faithfulness（忠実性）と Answer Relevancy（回答関連性）を評価する。
 mark-1/evaluate.py と同等の機能を Haystack 2.x パイプライン上で再実装。
@@ -18,9 +18,8 @@ from openai import OpenAI
 # メインの RAG システムからインポート
 from main import (
     DATA_DIR,
-    JAPANESE_BM25_REGEX,
     SYSTEM_PROMPT,
-    BM25_TOP_K,
+    TOP_K,
     CHUNK_SIZE,
     CHUNK_OVERLAP,
     build_indexing_pipeline,
@@ -78,9 +77,7 @@ def initialize_rag_system():
     pipeline_logger.setLevel(logging.WARNING)
 
     print("📦 InMemoryDocumentStore を初期化中…")
-    document_store = InMemoryDocumentStore(
-        bm25_tokenization_regex=JAPANESE_BM25_REGEX,
-    )
+    document_store = InMemoryDocumentStore()
 
     print(f"📄 ドキュメントを読み込み中… (ソース: {DATA_DIR})")
     documents = load_all_documents()
@@ -227,7 +224,7 @@ def evaluate_with_llm(
 def run_simple_evaluation(verbose: bool = True):
     """テストケースを一括で評価"""
     print("=" * 60)
-    print("RAG 評価システム（Haystack 2.x + BM25 / LLM 直接評価）")
+    print("RAG 評価システム（Haystack 2.x + ベクトル検索 / LLM 直接評価）")
     print("=" * 60)
 
     # RAG 初期化
@@ -335,7 +332,7 @@ def run_simple_evaluation(verbose: bool = True):
 def interactive_evaluation():
     """対話形式で単一の質問を評価"""
     print("=" * 60)
-    print("RAG 対話評価モード (Haystack 2.x + BM25)")
+    print("RAG 対話評価モード (Haystack 2.x + ベクトル検索)")
     print("=" * 60)
 
     query_pipeline = initialize_rag_system()
